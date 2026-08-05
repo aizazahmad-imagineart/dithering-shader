@@ -1030,6 +1030,23 @@
     });
   }
 
+  // Real Live Photo MOVs use major_brand "qt  " (genuine QuickTime); browsers'
+  // MediaRecorder writes a generic ISO/MP4 brand instead. Cheap, safe to match —
+  // run this first so every later size calculation already accounts for it.
+  function patchFtypBrand(mp4Bytes){
+    var bytes = new Uint8Array(mp4Bytes);
+    var topBoxes = parseBoxes(bytes, 0, bytes.length);
+    var ftypBox = topBoxes.filter(function(b){ return b.type === "ftyp"; })[0];
+    if(!ftypBox) return bytes;
+    var payload = new Uint8Array(12); // major_brand(4) + minor_version(4) + one compatible brand(4)
+    "qt  ".split("").forEach(function(ch, i){ payload[i] = ch.charCodeAt(0); });
+    "qt  ".split("").forEach(function(ch, i){ payload[8+i] = ch.charCodeAt(0); });
+    var newFtyp = makeBox("ftyp", payload);
+    return concatBytes(topBoxes.map(function(b){
+      return b === ftypBox ? newFtyp : bytes.slice(b.start, b.end);
+    }));
+  }
+
   function injectContentIdentifierIntoMp4(mp4Bytes, uuid){
     var bytes = new Uint8Array(mp4Bytes); // mutable copy
     var topBoxes = parseBoxes(bytes, 0, bytes.length);
@@ -1273,7 +1290,8 @@
           videoBlob.arrayBuffer().then(function(videoBuf){
             var taggedMovBytes;
             try{
-              taggedMovBytes = injectContentIdentifierIntoMp4(new Uint8Array(videoBuf), uuid);
+              taggedMovBytes = patchFtypBrand(new Uint8Array(videoBuf));
+              taggedMovBytes = injectContentIdentifierIntoMp4(taggedMovBytes, uuid);
               taggedMovBytes = addStillImageTimeTrack(taggedMovBytes);
             } catch(err){
               toast("Couldn't tag the video: " + err.message);
