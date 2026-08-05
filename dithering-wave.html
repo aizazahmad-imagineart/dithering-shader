@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dithering Wave</title>
+<style>
+  :root{
+    --bg: #0a0a0c;
+    --panel: rgba(17,19,24,0.82);
+    --hairline: #2a2d35;
+    --text: #e8e6e0;
+    --text-dim: #8b8f99;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  *{ box-sizing:border-box; }
+  html,body{ margin:0; padding:0; width:100%; height:100%; background:var(--bg); overflow:hidden; }
+  body{ font-family:var(--mono); color:var(--text); }
+
+  canvas#gl{ position:fixed; inset:0; width:100%; height:100%; display:block; }
+
+  .title{
+    position:fixed; top:28px; left:32px; z-index:5;
+    font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:var(--text-dim);
+    pointer-events:none;
+  }
+  .title b{ color:var(--text); font-weight:600; }
+
+  .dock{
+    position:fixed; left:50%; bottom:24px; transform:translateX(-50%);
+    z-index:10;
+    background:var(--panel);
+    border:1px solid var(--hairline);
+    border-radius:14px;
+    padding:14px 18px;
+    backdrop-filter: blur(14px) saturate(1.2);
+    -webkit-backdrop-filter: blur(14px) saturate(1.2);
+    display:flex; align-items:center; flex-wrap:wrap; justify-content:center; gap:14px 20px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.45);
+    max-width: calc(100vw - 32px);
+    max-height: calc(100vh - 48px);
+    overflow-y: auto;
+  }
+
+  .group{ display:flex; flex-direction:column; gap:7px; }
+  .group-label{ font-size:9px; letter-spacing:0.12em; text-transform:uppercase; color:var(--text-dim); }
+
+  .swatches{ display:flex; gap:6px; }
+  .swatch{
+    width:26px; height:26px; border-radius:6px; padding:0; cursor:pointer;
+    border:1.5px solid transparent; background:transparent;
+    image-rendering: pixelated;
+    transition: transform 0.12s ease, border-color 0.12s ease;
+  }
+  .swatch canvas{ width:100%; height:100%; border-radius:4.5px; display:block; image-rendering:pixelated; }
+  .swatch:hover{ transform: translateY(-2px); }
+  .swatch.active{ border-color: var(--text); }
+
+  .sliderrow{ display:flex; align-items:center; gap:8px; }
+  input[type=range]{
+    -webkit-appearance:none; appearance:none;
+    width:84px; height:2px; background:var(--hairline); border-radius:2px; outline:none;
+  }
+  input[type=range]::-webkit-slider-thumb{
+    -webkit-appearance:none; width:11px; height:11px; border-radius:50%;
+    background:var(--text); cursor:pointer; border:2px solid var(--bg);
+  }
+  .val{ font-size:10px; color:var(--text-dim); min-width:28px; text-align:right; }
+
+  input[type=color]{
+    width:26px; height:26px; border:1.5px solid var(--hairline); border-radius:6px;
+    background:none; padding:0; cursor:pointer;
+  }
+  input[type=color]::-webkit-color-swatch-wrapper{ padding:2px; }
+  input[type=color]::-webkit-color-swatch{ border:none; border-radius:4px; }
+
+  .select-wrap{ position:relative; display:flex; align-items:center; }
+  .select-wrap::after{
+    content:"⌄"; position:absolute; right:8px; top:50%; transform:translateY(-52%);
+    color:var(--text-dim); font-size:11px; pointer-events:none;
+  }
+  .dock-select{
+    -webkit-appearance:none; appearance:none;
+    background:rgba(255,255,255,0.03);
+    border:1.5px solid var(--hairline);
+    border-radius:6px;
+    color:var(--text);
+    font-family:var(--mono); font-size:11px;
+    padding:6px 24px 6px 10px;
+    height:26px;
+    cursor:pointer;
+    outline:none;
+  }
+  .dock-select option{ background:#14161b; color:var(--text); }
+
+  .divider{ width:1px; align-self:stretch; background:var(--hairline); }
+
+  .dlbtn{
+    display:flex; align-items:center; gap:8px;
+    background:var(--text); color:#111;
+    border:none; border-radius:9px; padding:0 16px; height:38px;
+    font-family:var(--mono); font-size:11px; font-weight:600; letter-spacing:0.04em;
+    cursor:pointer; white-space:nowrap;
+    transition: opacity 0.15s ease;
+  }
+  .dlbtn:disabled{ opacity:0.55; cursor:default; }
+  .dlbtn:not(:disabled):hover{ opacity:0.88; }
+
+  .ring{
+    width:14px; height:14px; border-radius:50%;
+    border:2px solid rgba(0,0,0,0.25); border-top-color:#111;
+    animation: spin 0.7s linear infinite;
+    display:none;
+  }
+  .dlbtn.busy .ring{ display:inline-block; }
+  .dlbtn.busy .dllabel{ display:none; }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
+
+  .toast{
+    position:fixed; left:50%; bottom:80px; transform:translateX(-50%);
+    background:var(--panel); border:1px solid var(--hairline); border-radius:8px;
+    padding:8px 14px; font-size:11px; color:var(--text-dim); z-index:20;
+    opacity:0; pointer-events:none; transition: opacity 0.25s ease;
+  }
+  .toast.show{ opacity:1; }
+
+  @media (max-width: 640px){
+    .dock{ gap:14px; padding:12px; }
+    .divider{ display:none; }
+  }
+</style>
+</head>
+<body>
+
+<canvas id="gl"></canvas>
+<div class="title"><b>Dithering</b> / <span id="titleProfile">wave</span> / 8×8</div>
+<div class="toast" id="toast"></div>
+
+<div class="dock">
+  <div class="group">
+    <div class="group-label">Motion</div>
+    <div class="select-wrap">
+      <select id="profile" class="dock-select"></select>
+    </div>
+  </div>
+
+  <div class="divider"></div>
+
+  <div class="group">
+    <div class="group-label">Color</div>
+    <div class="swatches" id="swatches"></div>
+  </div>
+
+  <div class="divider"></div>
+
+  <div class="group">
+    <div class="group-label">Background</div>
+    <input type="color" id="colorBack" value="#001122">
+  </div>
+
+  <div class="divider"></div>
+
+  <div class="group">
+    <div class="group-label">Pixel size</div>
+    <div class="sliderrow">
+      <input type="range" id="pxSize" min="1" max="10" step="1" value="3">
+      <span class="val" id="pxSizeVal">3</span>
+    </div>
+  </div>
+
+  <div class="group">
+    <div class="group-label">Speed</div>
+    <div class="sliderrow">
+      <input type="range" id="speed" min="0.05" max="2" step="0.05" value="0.6">
+      <span class="val" id="speedVal">0.6</span>
+    </div>
+  </div>
+
+  <div class="divider"></div>
+
+  <div class="group">
+    <div class="group-label">Export size</div>
+    <div class="select-wrap">
+      <select id="resolution" class="dock-select"></select>
+    </div>
+  </div>
+
+  <div class="divider"></div>
+
+  <button class="dlbtn" id="downloadBtn">
+    <span class="ring"></span>
+    <span class="dllabel">Download loop</span>
+  </button>
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  // ---------- palette: bright hues, fixed saturation/lightness ----------
+  var SAT = 82, LIGHT = 56;
+  var HUES = [
+    { name:"Red",     h: 350 },
+    { name:"Orange",  h: 24  },
+    { name:"Amber",   h: 42  },
+    { name:"Lime",    h: 84  },
+    { name:"Green",   h: 140 },
+    { name:"Teal",    h: 172 },
+    { name:"Cyan",    h: 190 },
+    { name:"Blue",    h: 214 },
+    { name:"Indigo",  h: 248 },
+    { name:"Violet",  h: 272 },
+    { name:"Magenta", h: 300 },
+    { name:"Pink",    h: 330 }
+  ];
+
+  function hslToRgb(h, s, l){
+    h = ((h % 360) + 360) % 360; s/=100; l/=100;
+    var c = (1 - Math.abs(2*l - 1)) * s;
+    var x = c * (1 - Math.abs((h/60) % 2 - 1));
+    var m = l - c/2;
+    var r,g,b;
+    if(h<60){ r=c;g=x;b=0; } else if(h<120){ r=x;g=c;b=0; }
+    else if(h<180){ r=0;g=c;b=x; } else if(h<240){ r=0;g=x;b=c; }
+    else if(h<300){ r=x;g=0;b=c; } else { r=c;g=0;b=x; }
+    return [(r+m), (g+m), (b+m)]; // 0..1
+  }
+  function rgbToHex(rgb){
+    return "#" + rgb.map(function(v){
+      var n = Math.round(Math.max(0,Math.min(1,v))*255);
+      return n.toString(16).padStart(2,"0");
+    }).join("");
+  }
+  function hexToRgb(hex){
+    hex = hex.replace("#","");
+    return [
+      parseInt(hex.substring(0,2),16)/255,
+      parseInt(hex.substring(2,4),16)/255,
+      parseInt(hex.substring(4,6),16)/255
+    ];
+  }
+
+  // ---------- bayer 8x8 ordered-dither matrix ----------
+  var BAYER8 = [
+    0,32,8,40,2,34,10,42,
+    48,16,56,24,50,18,58,26,
+    12,44,4,36,14,46,6,38,
+    60,28,52,20,62,30,54,22,
+    3,35,11,43,1,33,9,41,
+    51,19,59,27,49,17,57,25,
+    15,47,7,39,13,45,5,37,
+    63,31,55,23,61,29,53,21
+  ];
+
+  // ---------- movement profiles ----------
+  var PROFILES = [
+    { value: 0, name: "Interference" },
+    { value: 1, name: "Ocean Wave" },
+    { value: 2, name: "Horizon" },
+    { value: 3, name: "Ribbon Glow" },
+    { value: 4, name: "Radial Ripple" },
+    { value: 5, name: "Plasma Drift" }
+  ];
+
+  // ---------- export resolutions ----------
+  var RESOLUTIONS = [
+    { value: 0,    name: "Match window" },
+    { value: 1080, name: "1080 × 1080" },
+    { value: 720,  name: "720 × 720" },
+    { value: 512,  name: "512 × 512" },
+    { value: 300,  name: "300 × 300" },
+    { value: 128,  name: "128 × 128" }
+  ];
+  // pixel-size slider is tuned against this reference frame width; export frames
+  // scale it down proportionally so a 300x300 clip doesn't look chunky
+  var PX_REFERENCE = 1024;
+
+  // ---------- state ----------
+  var state = {
+    colorFront: hexToRgb("#ff0088"),
+    colorBack: hexToRgb("#001122"),
+    pxSize: 3,
+    speed: 0.6,
+    profile: 1,
+    exportRes: 300
+  };
+
+  // ---------- WebGL setup ----------
+  var canvas = document.getElementById("gl");
+
+  var VERT = "#version 300 es\n" +
+    "in vec2 a_pos;\n" +
+    "void main(){ gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
+
+  var FRAG = "#version 300 es\n" +
+    "precision highp float;\n" +
+    "uniform vec2 u_resolution;\n" +
+    "uniform float u_time;\n" +
+    "uniform float u_pxSize;\n" +
+    "uniform vec3 u_colorBack;\n" +
+    "uniform vec3 u_colorFront;\n" +
+    "uniform sampler2D u_dither;\n" +
+    "uniform int u_profile;\n" +
+    "out vec4 outColor;\n" +
+    "void main(){\n" +
+    "  vec2 frag = gl_FragCoord.xy;\n" +
+    "  float px = max(u_pxSize, 1.0);\n" +
+    "  vec2 blockCoord = floor(frag / px);\n" +
+    "  vec2 uv = (blockCoord * px) / u_resolution;\n" +
+    "  float ar = u_resolution.x / u_resolution.y;\n" +
+    "  float t = u_time;\n" +
+    "  vec2 dCoord = mod(blockCoord, 8.0);\n" +
+    "  vec2 dUV = (dCoord + 0.5) / 8.0;\n" +
+    "  float threshold = texture(u_dither, dUV).r;\n" +
+    "  vec3 outc;\n" +
+    "  float v;\n" +
+    "    if(u_profile == 1){\n" +
+    "      float phase = uv.x * 14.0 + uv.y * 5.0 - t * 2.0;\n" +
+    "      float s = sin(phase);\n" +
+    "      float shaped = sign(s) * pow(abs(s), 0.85);\n" +
+    "      v = shaped * 0.5 + 0.5;\n" +
+    "    } else if(u_profile == 2){\n" +
+    "      float h = 0.50 + 0.09 * sin(uv.x * 3.0 + t) + 0.045 * sin(uv.x * 7.2 - t * 2.0);\n" +
+    "      float d = h - uv.y;\n" +
+    "      float turb = smoothstep(-0.05, 0.30, d);\n" +
+    "      d += 0.035 * sin(uv.x * 7.0 - t * 3.0) * turb;\n" +
+    "      d += 0.012 * sin(uv.x * 17.0 + uv.y * 4.0 + t * 2.0) * turb;\n" +
+    "      v = smoothstep(-0.15, 0.02, d);\n" +
+    "    } else if(u_profile == 3){\n" +
+    "      float p1 = 0.42 + 0.10 * sin(uv.x * 3.1 + t);\n" +
+    "      float p2 = 0.55 + 0.07 * sin(uv.x * 4.7 - t * 2.0);\n" +
+    "      float p3 = 0.50 + 0.13 * sin(uv.x * 2.0 + t * 3.0);\n" +
+    "      float d1 = uv.y - p1;\n" +
+    "      float d2 = uv.y - p2;\n" +
+    "      float d3 = uv.y - p3;\n" +
+    "      float w1 = smoothstep(0.14, 0.03, abs(d1));\n" +
+    "      float w2 = smoothstep(0.09, 0.02, abs(d2));\n" +
+    "      float w3 = smoothstep(0.19, 0.05, abs(d3));\n" +
+    "      float glow = exp(-(d1*d1) / 0.0022) * 0.9 * w1\n" +
+    "                 + exp(-(d2*d2) / 0.0009) * 0.7 * w2\n" +
+    "                 + exp(-(d3*d3) / 0.0040) * 0.5 * w3;\n" +
+    "      v = clamp(glow, 0.0, 1.0);\n" +
+    "    } else if(u_profile == 4){\n" +
+    "      vec2 c = vec2((uv.x - 0.5) * ar, uv.y - 0.5);\n" +
+    "      float r = length(c);\n" +
+    "      v = sin(r * 26.0 - t * 3.0) * 0.5 + 0.5;\n" +
+    "    } else if(u_profile == 5){\n" +
+    "      float p = sin(uv.x * 10.0 + t)\n" +
+    "              + sin(uv.y * 10.0 - t)\n" +
+    "              + sin((uv.x + uv.y) * 10.0 + t)\n" +
+    "              + sin(length(vec2((uv.x - 0.5) * ar, uv.y - 0.5)) * 10.0 - t * 2.0);\n" +
+    "      v = p / 4.0 * 0.5 + 0.5;\n" +
+    "    } else {\n" +
+    "      v = sin((uv.x * 6.0 + uv.y * 3.0) + t)\n" +
+    "        + 0.5 * sin((uv.x * 10.0 - uv.y * 4.0) - t * 2.0);\n" +
+    "      v = clamp(v / 1.5 * 0.5 + 0.5, 0.0, 1.0);\n" +
+    "    }\n" +
+    "  outc = v > threshold ? u_colorFront : u_colorBack;\n" +
+    "  outColor = vec4(outc, 1.0);\n" +
+    "}\n";
+
+  function buildRenderer(canvasEl){
+    var rgl = canvasEl.getContext("webgl2", { preserveDrawingBuffer: true });
+    if(!rgl){ throw new Error("WebGL2 is required for this effect."); }
+
+    function compile(type, src){
+      var sh = rgl.createShader(type);
+      rgl.shaderSource(sh, src);
+      rgl.compileShader(sh);
+      if(!rgl.getShaderParameter(sh, rgl.COMPILE_STATUS)){
+        throw new Error(rgl.getShaderInfoLog(sh));
+      }
+      return sh;
+    }
+    var prog = rgl.createProgram();
+    rgl.attachShader(prog, compile(rgl.VERTEX_SHADER, VERT));
+    rgl.attachShader(prog, compile(rgl.FRAGMENT_SHADER, FRAG));
+    rgl.linkProgram(prog);
+    if(!rgl.getProgramParameter(prog, rgl.LINK_STATUS)){
+      throw new Error(rgl.getProgramInfoLog(prog));
+    }
+    rgl.useProgram(prog);
+
+    var quad = new Float32Array([-1,-1, 1,-1, -1,1, 1,1]);
+    var vbo = rgl.createBuffer();
+    rgl.bindBuffer(rgl.ARRAY_BUFFER, vbo);
+    rgl.bufferData(rgl.ARRAY_BUFFER, quad, rgl.STATIC_DRAW);
+    var posLoc = rgl.getAttribLocation(prog, "a_pos");
+    rgl.enableVertexAttribArray(posLoc);
+    rgl.vertexAttribPointer(posLoc, 2, rgl.FLOAT, false, 0, 0);
+
+    var ditherTex = rgl.createTexture();
+    rgl.bindTexture(rgl.TEXTURE_2D, ditherTex);
+    var ditherData = new Uint8Array(64);
+    for(var i=0;i<64;i++){ ditherData[i] = Math.round((BAYER8[i]/64) * 255); }
+    rgl.texImage2D(rgl.TEXTURE_2D, 0, rgl.R8, 8, 8, 0, rgl.RED, rgl.UNSIGNED_BYTE, ditherData);
+    rgl.texParameteri(rgl.TEXTURE_2D, rgl.TEXTURE_MIN_FILTER, rgl.NEAREST);
+    rgl.texParameteri(rgl.TEXTURE_2D, rgl.TEXTURE_MAG_FILTER, rgl.NEAREST);
+    rgl.texParameteri(rgl.TEXTURE_2D, rgl.TEXTURE_WRAP_S, rgl.CLAMP_TO_EDGE);
+    rgl.texParameteri(rgl.TEXTURE_2D, rgl.TEXTURE_WRAP_T, rgl.CLAMP_TO_EDGE);
+
+    var uRes = rgl.getUniformLocation(prog, "u_resolution");
+    var uTime = rgl.getUniformLocation(prog, "u_time");
+    var uPx = rgl.getUniformLocation(prog, "u_pxSize");
+    var uBack = rgl.getUniformLocation(prog, "u_colorBack");
+    var uFront = rgl.getUniformLocation(prog, "u_colorFront");
+    var uDither = rgl.getUniformLocation(prog, "u_dither");
+    var uProfile = rgl.getUniformLocation(prog, "u_profile");
+
+    function draw(timeSeconds, w, h, pxPixels){
+      if(canvasEl.width !== w || canvasEl.height !== h){
+        canvasEl.width = w; canvasEl.height = h;
+      }
+      rgl.viewport(0, 0, w, h);
+      rgl.useProgram(prog);
+      rgl.uniform2f(uRes, w, h);
+      rgl.uniform1f(uTime, timeSeconds);
+      rgl.uniform1f(uPx, pxPixels);
+      rgl.uniform3f(uBack, state.colorBack[0], state.colorBack[1], state.colorBack[2]);
+      rgl.uniform3f(uFront, state.colorFront[0], state.colorFront[1], state.colorFront[2]);
+      rgl.uniform1i(uProfile, state.profile);
+      rgl.activeTexture(rgl.TEXTURE0);
+      rgl.bindTexture(rgl.TEXTURE_2D, ditherTex);
+      rgl.uniform1i(uDither, 0);
+      rgl.bindBuffer(rgl.ARRAY_BUFFER, vbo);
+      rgl.enableVertexAttribArray(posLoc);
+      rgl.vertexAttribPointer(posLoc, 2, rgl.FLOAT, false, 0, 0);
+      rgl.drawArrays(rgl.TRIANGLE_STRIP, 0, 4);
+    }
+
+    return { gl: rgl, draw: draw };
+  }
+
+  var liveRenderer;
+  try{
+    liveRenderer = buildRenderer(canvas);
+  } catch(err){
+    alert(err.message);
+    return;
+  }
+
+  function liveDpr(){ return Math.min(window.devicePixelRatio || 1, 2); }
+
+  function resize(){
+    var dpr = liveDpr();
+    var w = Math.floor(window.innerWidth * dpr);
+    var h = Math.floor(window.innerHeight * dpr);
+    if(canvas.width !== w || canvas.height !== h){
+      liveRenderer.gl.viewport(0, 0, w, h);
+    }
+    return { w: w, h: h };
+  }
+  window.addEventListener("resize", resize);
+
+  function render(timeSeconds){
+    var size = resize();
+    liveRenderer.draw(timeSeconds, size.w, size.h, state.pxSize * liveDpr());
+  }
+
+  var startTime = performance.now();
+  var rafId = null;
+  function liveLoop(now){
+    var t = ((now - startTime) / 1000) * state.speed;
+    render(t);
+    rafId = requestAnimationFrame(liveLoop);
+  }
+  rafId = requestAnimationFrame(liveLoop);
+
+  // ---------- UI: color swatches (mini dithered previews) ----------
+  var swatchesEl = document.getElementById("swatches");
+  var activeBtn = null;
+
+  function drawSwatchPreview(cvs, frontRgb, backRgb){
+    var ctx = cvs.getContext("2d");
+    var img = ctx.createImageData(8,8);
+    for(var y=0;y<8;y++){
+      for(var x=0;x<8;x++){
+        var idx = y*8+x;
+        var threshold = BAYER8[idx]/64;
+        var useFront = 0.55 > threshold; // fixed mid-value dither mix for preview
+        var c = useFront ? frontRgb : backRgb;
+        var p = idx*4;
+        img.data[p]   = Math.round(c[0]*255);
+        img.data[p+1] = Math.round(c[1]*255);
+        img.data[p+2] = Math.round(c[2]*255);
+        img.data[p+3] = 255;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+
+  HUES.forEach(function(hue){
+    var rgb = hslToRgb(hue.h, SAT, LIGHT);
+    var btn = document.createElement("button");
+    btn.className = "swatch";
+    btn.title = hue.name;
+    var cvs = document.createElement("canvas");
+    cvs.width = 8; cvs.height = 8;
+    btn.appendChild(cvs);
+    drawSwatchPreview(cvs, rgb, state.colorBack);
+    btn.addEventListener("click", function(){
+      state.colorFront = rgb;
+      if(activeBtn) activeBtn.classList.remove("active");
+      btn.classList.add("active");
+      activeBtn = btn;
+    });
+    swatchesEl.appendChild(btn);
+    btn._rgb = rgb; btn._cvs = cvs;
+  });
+
+  function refreshSwatchPreviews(){
+    Array.prototype.forEach.call(swatchesEl.children, function(btn){
+      drawSwatchPreview(btn._cvs, btn._rgb, state.colorBack);
+    });
+  }
+
+  // ---------- UI: movement profile ----------
+  var profileSelect = document.getElementById("profile");
+  var titleProfile = document.getElementById("titleProfile");
+  PROFILES.forEach(function(p){
+    var opt = document.createElement("option");
+    opt.value = p.value;
+    opt.textContent = p.name;
+    if(p.value === state.profile) opt.selected = true;
+    profileSelect.appendChild(opt);
+  });
+  function updateTitleProfile(){
+    var p = PROFILES[state.profile] || PROFILES[0];
+    titleProfile.textContent = p.name.toLowerCase();
+  }
+  updateTitleProfile();
+  profileSelect.addEventListener("change", function(){
+    state.profile = parseInt(profileSelect.value, 10);
+    updateTitleProfile();
+  });
+
+  // ---------- UI: export resolution ----------
+  var resolutionSelect = document.getElementById("resolution");
+  RESOLUTIONS.forEach(function(r){
+    var opt = document.createElement("option");
+    opt.value = r.value;
+    opt.textContent = r.name;
+    if(r.value === state.exportRes) opt.selected = true;
+    resolutionSelect.appendChild(opt);
+  });
+  resolutionSelect.addEventListener("change", function(){
+    state.exportRes = parseInt(resolutionSelect.value, 10);
+  });
+
+  // ---------- UI: background color, pxSize, speed ----------
+  var colorBackInput = document.getElementById("colorBack");
+  colorBackInput.addEventListener("input", function(){
+    state.colorBack = hexToRgb(colorBackInput.value);
+    refreshSwatchPreviews();
+  });
+
+  var pxSizeInput = document.getElementById("pxSize");
+  var pxSizeVal = document.getElementById("pxSizeVal");
+  pxSizeInput.addEventListener("input", function(){
+    state.pxSize = parseFloat(pxSizeInput.value);
+    pxSizeVal.textContent = state.pxSize;
+  });
+
+  var speedInput = document.getElementById("speed");
+  var speedVal = document.getElementById("speedVal");
+  speedInput.addEventListener("input", function(){
+    state.speed = parseFloat(speedInput.value);
+    speedVal.textContent = state.speed.toFixed(2);
+  });
+
+  // ---------- toast ----------
+  var toastEl = document.getElementById("toast");
+  var toastTimer = null;
+  function toast(msg){
+    toastEl.textContent = msg;
+    toastEl.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function(){ toastEl.classList.remove("show"); }, 3200);
+  }
+
+  // ---------- video export: deterministic, seamlessly looped ----------
+  var downloadBtn = document.getElementById("downloadBtn");
+  var exportCanvas = document.createElement("canvas");
+  var exportRenderer = null;
+  function getExportRenderer(){
+    if(!exportRenderer) exportRenderer = buildRenderer(exportCanvas);
+    return exportRenderer;
+  }
+
+  function pickMimeType(){
+    var candidates = [
+      "video/webm;codecs=vp9",
+      "video/webm;codecs=vp8",
+      "video/webm",
+      "video/mp4"
+    ];
+    for(var i=0;i<candidates.length;i++){
+      if(window.MediaRecorder && MediaRecorder.isTypeSupported(candidates[i])){
+        return candidates[i];
+      }
+    }
+    return "";
+  }
+
+  downloadBtn.addEventListener("click", function(){
+    if(downloadBtn.classList.contains("busy")) return;
+    if(!window.MediaRecorder){
+      toast("MediaRecorder is not supported in this browser.");
+      return;
+    }
+    var mimeType = pickMimeType();
+    if(!mimeType){
+      toast("No supported video codec found in this browser.");
+      return;
+    }
+
+    downloadBtn.classList.add("busy");
+    downloadBtn.disabled = true;
+
+    // cancel live preview loop while we render the deterministic export
+    cancelAnimationFrame(rafId);
+
+    var exportW, exportH, exportPx;
+    if(state.exportRes === 0){
+      exportW = canvas.width;
+      exportH = canvas.height;
+      exportPx = state.pxSize * liveDpr();
+    } else {
+      exportW = state.exportRes;
+      exportH = state.exportRes;
+      exportPx = Math.max(1, Math.round(state.pxSize * exportW / PX_REFERENCE));
+    }
+
+    var xr = getExportRenderer();
+    var xcanvas = exportCanvas;
+    xcanvas.width = exportW;
+    xcanvas.height = exportH;
+
+    var FPS = 30;
+    var TARGET_DURATION = 3.5; // seconds, within the requested 3-4s window
+    // number of full sine cycles so the clip loops seamlessly regardless of speed
+    var cycles = Math.max(1, Math.round(state.speed * TARGET_DURATION / (2 * Math.PI)));
+    var angularSpeed = (cycles * 2 * Math.PI) / TARGET_DURATION;
+    var totalFrames = Math.round(FPS * TARGET_DURATION);
+
+    var stream = xcanvas.captureStream(0); // manual frame control
+    var track = stream.getVideoTracks()[0];
+    var canRequestFrame = typeof track.requestFrame === "function";
+    if(!canRequestFrame){
+      // fallback: automatic capture at fixed fps
+      stream = xcanvas.captureStream(FPS);
+    }
+
+    var chunks = [];
+    var recorder = new MediaRecorder(stream, { mimeType: mimeType, videoBitsPerSecond: 8000000 });
+    recorder.ondataavailable = function(e){ if(e.data && e.data.size > 0) chunks.push(e.data); };
+    recorder.onstop = function(){
+      var blob = new Blob(chunks, { type: mimeType.split(";")[0] });
+      var ext = mimeType.indexOf("mp4") !== -1 ? "mp4" : "webm";
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = url;
+      a.download = "dithering-wave-loop-" + exportW + "x" + exportH + "." + ext;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function(){ URL.revokeObjectURL(url); }, 4000);
+
+      downloadBtn.classList.remove("busy");
+      downloadBtn.disabled = false;
+      toast("Saved " + TARGET_DURATION.toFixed(1) + "s loop, " + exportW + "×" + exportH + " (" + ext.toUpperCase() + ")");
+
+      rafId = requestAnimationFrame(liveLoop);
+    };
+
+    recorder.start();
+
+    var frame = 0;
+    function renderExportFrame(){
+      if(frame > totalFrames){
+        recorder.stop();
+        return;
+      }
+      var t = (frame / FPS) * angularSpeed;
+      xr.draw(t, exportW, exportH, exportPx);
+      if(canRequestFrame){
+        track.requestFrame();
+        frame++;
+        setTimeout(renderExportFrame, 1000 / FPS);
+      } else {
+        frame++;
+        requestAnimationFrame(renderExportFrame);
+      }
+    }
+    renderExportFrame();
+  });
+
+})();
+</script>
+</body>
+</html>
