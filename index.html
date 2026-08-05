@@ -655,7 +655,7 @@
 
     if(f.kind === "livephoto"){
       formatNote.hidden = false;
-      formatNote.textContent = "Experimental: saves a JPEG+MOV pair tagged to pair as a Live Photo. Works best AirDropped together from a Mac — a direct Files → Photos import may not merge them on every iOS version.";
+      formatNote.textContent = "Experimental: saves a JPEG+MOV pair with matching content and still-image-time markers so iOS can pair them as a Live Photo. Still being validated on-device — if a direct Files → Photos import doesn't merge them, try AirDropping the pair from a Mac instead.";
     } else {
       formatNote.hidden = true;
     }
@@ -813,22 +813,51 @@
   }
 
   function buildExifApp1(makerNoteBytes){
-    var TIFF_HEADER_LEN = 8, IFD0_LEN = 18, EXIFSUB_LEN = 18;
+    var TIFF_HEADER_LEN = 8;
+    // IFD0 carries Make/Model/Software (real iPhone photos always have these
+    // alongside the Maker Note) plus the pointer to the Exif SubIFD.
+    var makeStr = new TextEncoder().encode("Apple\0");
+    var modelStr = new TextEncoder().encode("iPhone\0");
+    var softwareStr = new TextEncoder().encode("17.0\0");
+    var IFD0_ENTRY_COUNT = 4;
+    var IFD0_LEN = 2 + IFD0_ENTRY_COUNT*12 + 4;
+    var EXIFSUB_LEN = 18;
+
     var exifIfdOffset = TIFF_HEADER_LEN;
-    var makerNoteOffset = TIFF_HEADER_LEN + IFD0_LEN + EXIFSUB_LEN;
+    var exifSubIfdOffset = TIFF_HEADER_LEN + IFD0_LEN;
+    var stringAreaOffset = exifSubIfdOffset + EXIFSUB_LEN;
+    var makeOffset = stringAreaOffset;
+    var modelOffset = makeOffset + makeStr.length;
+    var softwareOffset = modelOffset + modelStr.length;
+    var makerNoteOffset = softwareOffset + softwareStr.length;
+
     var tiff = new Uint8Array(makerNoteOffset + makerNoteBytes.length);
     var view = new DataView(tiff.buffer);
     var p = 0;
     tiff[p++] = 0x4D; tiff[p++] = 0x4D;         // "MM"
     view.setUint16(p, 0x002A, false); p += 2;   // TIFF magic
     view.setUint32(p, exifIfdOffset, false); p += 4;
-    // IFD0: one entry pointing to the Exif SubIFD
-    view.setUint16(p, 1, false); p += 2;
+
+    // IFD0
+    view.setUint16(p, IFD0_ENTRY_COUNT, false); p += 2;
+    view.setUint16(p, 0x010F, false); p += 2;   // Make
+    view.setUint16(p, 2, false); p += 2;        // ASCII
+    view.setUint32(p, makeStr.length, false); p += 4;
+    view.setUint32(p, makeOffset, false); p += 4;
+    view.setUint16(p, 0x0110, false); p += 2;   // Model
+    view.setUint16(p, 2, false); p += 2;
+    view.setUint32(p, modelStr.length, false); p += 4;
+    view.setUint32(p, modelOffset, false); p += 4;
+    view.setUint16(p, 0x0131, false); p += 2;   // Software
+    view.setUint16(p, 2, false); p += 2;
+    view.setUint32(p, softwareStr.length, false); p += 4;
+    view.setUint32(p, softwareOffset, false); p += 4;
     view.setUint16(p, 0x8769, false); p += 2;   // ExifIFDPointer
     view.setUint16(p, 4, false); p += 2;        // LONG
     view.setUint32(p, 1, false); p += 4;
-    view.setUint32(p, TIFF_HEADER_LEN + IFD0_LEN, false); p += 4;
+    view.setUint32(p, exifSubIfdOffset, false); p += 4;
     view.setUint32(p, 0, false); p += 4;        // next IFD
+
     // Exif SubIFD: one entry pointing to the MakerNote
     view.setUint16(p, 1, false); p += 2;
     view.setUint16(p, 0x927C, false); p += 2;   // MakerNote
@@ -836,7 +865,11 @@
     view.setUint32(p, makerNoteBytes.length, false); p += 4;
     view.setUint32(p, makerNoteOffset, false); p += 4;
     view.setUint32(p, 0, false); p += 4;        // next IFD
-    tiff.set(makerNoteBytes, p);
+
+    tiff.set(makeStr, makeOffset);
+    tiff.set(modelStr, modelOffset);
+    tiff.set(softwareStr, softwareOffset);
+    tiff.set(makerNoteBytes, makerNoteOffset);
 
     var exifHeader = new Uint8Array([0x45,0x78,0x69,0x66,0x00,0x00]); // "Exif\0\0"
     var payloadLen = 2 + exifHeader.length + tiff.length;
@@ -985,6 +1018,169 @@
     }));
   }
 
+  // ----- MOV/MP4: still-image-time timed metadata track (best-effort, less rigorously
+  // verified than the content-identifier piece — see the format note in the UI) -----
+  function readU32(bytes, off){ return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(off, false); }
+
+  function findMvhdTimescale(bytes, moovBox){
+    var mvhd = parseBoxes(bytes, moovBox.dataStart, moovBox.end).filter(function(b){ return b.type === "mvhd"; })[0];
+    if(!mvhd) return 600;
+    var version = bytes[mvhd.dataStart];
+    return readU32(bytes, mvhd.dataStart + (version === 1 ? 20 : 12));
+  }
+  function findTrackIds(bytes, moovBox){
+    var traks = parseBoxes(bytes, moovBox.dataStart, moovBox.end).filter(function(b){ return b.type === "trak"; });
+    return traks.map(function(trak){
+      var tkhd = parseBoxes(bytes, trak.dataStart, trak.end).filter(function(b){ return b.type === "tkhd"; })[0];
+      var version = bytes[tkhd.dataStart];
+      return readU32(bytes, tkhd.dataStart + (version === 1 ? 20 : 12));
+    });
+  }
+
+  function makeMatrixIdentity(payload, offset){
+    var dv = new DataView(payload.buffer);
+    dv.setUint32(offset, 0x00010000, false);
+    dv.setUint32(offset+16, 0x00010000, false);
+    dv.setUint32(offset+32, 0x40000000, false);
+  }
+  function makeTkhd(trackId, movieDuration){
+    var payload = new Uint8Array(84);
+    var dv = new DataView(payload.buffer);
+    dv.setUint32(0, 0x00000007, false); // enabled + in-movie + in-preview
+    dv.setUint32(12, trackId, false);
+    dv.setUint32(20, movieDuration, false);
+    makeMatrixIdentity(payload, 40);
+    return makeBox("tkhd", payload);
+  }
+  function makeMdhd(timescale, duration){
+    var payload = new Uint8Array(24);
+    var dv = new DataView(payload.buffer);
+    dv.setUint32(12, timescale, false);
+    dv.setUint32(16, duration, false);
+    dv.setUint16(20, 0x55C4, false); // language = "und"
+    return makeBox("mdhd", payload);
+  }
+  function makeMdiaHdlr(handlerType){
+    var payload = new Uint8Array(25);
+    for(var i=0;i<4;i++) payload[8+i] = handlerType.charCodeAt(i);
+    return makeBox("hdlr", payload);
+  }
+  function makeDinf(){
+    var urlBox = makeBox("url ", new Uint8Array([0,0,0,1])); // self-contained flag
+    var drefPayload = concatBytes([new Uint8Array([0,0,0,0, 0,0,0,1]), urlBox]);
+    return makeBox("dinf", makeBox("dref", drefPayload));
+  }
+  function makeStillImageTimeTrak(opts){
+    // opts: {trackId, videoTrackId, movieTimescale, mediaTimescale, sampleDuration}
+    // returns {trak, stcoValueOffset} — stcoValueOffset is the byte offset, relative to
+    // the start of `trak`, of the one chunk_offset value the caller must patch in later.
+    var keys = makeKeysBox(["com.apple.quicktime.still-image-time"]);
+    var mebxPayload = new Uint8Array(8); // reserved(6) + data_reference_index(2)
+    mebxPayload[7] = 1;
+    var mebxEntry = makeBox("mebx", concatBytes([mebxPayload, keys]));
+    var stsdHeader = new Uint8Array(8);
+    new DataView(stsdHeader.buffer).setUint32(4, 1, false); // entry_count = 1
+    var stsd = makeBox("stsd", concatBytes([stsdHeader, mebxEntry]));
+
+    var stts = (function(){
+      var p = new Uint8Array(16);
+      var dv = new DataView(p.buffer);
+      dv.setUint32(4, 1, false);                    // entry_count
+      dv.setUint32(8, 1, false);                     // sample_count
+      dv.setUint32(12, opts.sampleDuration, false);   // sample_delta
+      return makeBox("stts", p);
+    })();
+    var stsc = (function(){
+      var p = new Uint8Array(20);
+      var dv = new DataView(p.buffer);
+      dv.setUint32(4, 1, false);   // entry_count
+      dv.setUint32(8, 1, false);   // first_chunk
+      dv.setUint32(12, 1, false);  // samples_per_chunk
+      dv.setUint32(16, 1, false);  // sample_description_index
+      return makeBox("stsc", p);
+    })();
+    var stsz = (function(){
+      var p = new Uint8Array(12);
+      var dv = new DataView(p.buffer);
+      dv.setUint32(4, 1, false); // sample_size (uniform, 1 byte per sample)
+      dv.setUint32(8, 1, false); // sample_count
+      return makeBox("stsz", p);
+    })();
+    var stco = (function(){
+      var p = new Uint8Array(12);
+      new DataView(p.buffer).setUint32(4, 1, false); // entry_count
+      // chunk_offset (4 bytes, at payload offset 8) left as 0 — patched once the
+      // final file layout is known, since it's an absolute file position
+      return makeBox("stco", p);
+    })();
+
+    var boxesBeforeStco = [stsd, stts, stsc, stsz];
+    var stbl = makeBox("stbl", concatBytes(boxesBeforeStco.concat([stco])));
+    var nmhd = makeBox("nmhd", new Uint8Array(4));
+    var dinf = makeDinf();
+    var minf = makeBox("minf", concatBytes([nmhd, dinf, stbl]));
+    var mdhd = makeMdhd(opts.mediaTimescale, opts.sampleDuration);
+    var hdlr = makeMdiaHdlr("meta");
+    var mdia = makeBox("mdia", concatBytes([mdhd, hdlr, minf]));
+    var cdscPayload = new Uint8Array(4);
+    new DataView(cdscPayload.buffer).setUint32(0, opts.videoTrackId, false);
+    var tref = makeBox("tref", makeBox("cdsc", cdscPayload));
+    var movieDuration = Math.round(opts.movieTimescale * (opts.sampleDuration / opts.mediaTimescale));
+    var tkhd = makeTkhd(opts.trackId, movieDuration);
+    var trak = makeBox("trak", concatBytes([tkhd, tref, mdia]));
+
+    // stco's chunk_offset sits 8 bytes into stco's payload, i.e. 16 bytes into the
+    // stco box (8-byte box header + 8-byte payload prefix). Locate stco's start by
+    // summing everything before it, all the way up through trak's own header.
+    var stblChildrenBeforeStco = boxesBeforeStco.reduce(function(s,b){ return s+b.length; }, 0);
+    var stcoStartInTrak = 8 /*trak header*/ + tkhd.length + tref.length +
+      8 /*mdia header*/ + mdhd.length + hdlr.length +
+      8 /*minf header*/ + nmhd.length + dinf.length +
+      8 /*stbl header*/ + stblChildrenBeforeStco;
+
+    return { trak: trak, stcoValueOffset: stcoStartInTrak + 16 };
+  }
+
+  function addStillImageTimeTrack(mp4Bytes){
+    var bytes = new Uint8Array(mp4Bytes);
+    var topBoxes = parseBoxes(bytes, 0, bytes.length);
+    var moovBox = topBoxes.filter(function(b){ return b.type === "moov"; })[0];
+    if(!moovBox) throw new Error("No moov box found in generated video");
+
+    var movieTimescale = findMvhdTimescale(bytes, moovBox);
+    var trackIds = findTrackIds(bytes, moovBox);
+    var newTrackId = Math.max.apply(null, trackIds.concat([0])) + 1;
+    var videoTrackId = trackIds[0];
+    var MEDIA_TIMESCALE = 600, SAMPLE_DURATION = 1; // ~1.7ms marker sample
+
+    var built = makeStillImageTimeTrak({
+      trackId: newTrackId,
+      videoTrackId: videoTrackId,
+      movieTimescale: movieTimescale,
+      mediaTimescale: MEDIA_TIMESCALE,
+      sampleDuration: SAMPLE_DURATION
+    });
+
+    var newMoovPayload = concatBytes([bytes.slice(moovBox.dataStart, moovBox.end), built.trak]);
+    var newMoovBox = makeBox("moov", newMoovPayload);
+    // the trak we appended sits right at the end of the new moov's payload
+    var trakOffsetInNewMoov = newMoovBox.length - built.trak.length;
+
+    var pieces = topBoxes.map(function(b){
+      return b === moovBox ? newMoovBox : bytes.slice(b.start, b.end);
+    });
+
+    // our marker sample lives in a brand new mdat appended at the very end, so no
+    // existing offsets anywhere else in the file need to change
+    var markerMdat = makeBox("mdat", new Uint8Array([0xFF]));
+    var priorLength = pieces.reduce(function(s,p){ return s + p.length; }, 0);
+    var sampleAbsoluteOffset = priorLength + 8; // skip the new mdat's own 8-byte header
+
+    new DataView(newMoovBox.buffer).setUint32(trakOffsetInNewMoov + built.stcoValueOffset, sampleAbsoluteOffset, false);
+
+    return concatBytes(pieces.concat([markerMdat]));
+  }
+
   function downloadLivePhoto(){
     if(!window.MediaRecorder){
       toast("MediaRecorder is not supported in this browser.");
@@ -1044,6 +1240,7 @@
             var taggedMovBytes;
             try{
               taggedMovBytes = injectContentIdentifierIntoMp4(new Uint8Array(videoBuf), uuid);
+              taggedMovBytes = addStillImageTimeTrack(taggedMovBytes);
             } catch(err){
               toast("Couldn't tag the video: " + err.message);
               finish();
