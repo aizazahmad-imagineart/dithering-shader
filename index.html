@@ -655,7 +655,7 @@
 
     if(f.kind === "livephoto"){
       formatNote.hidden = false;
-      formatNote.textContent = "Experimental: saves a JPEG+MOV pair with matching content and still-image-time markers so iOS can pair them as a Live Photo. Still being validated on-device — if a direct Files → Photos import doesn't merge them, try AirDropping the pair from a Mac instead.";
+      formatNote.textContent = "Experimental: saves a JPEG+MOV pair structured to match real Live Photo files byte-for-byte. Still being validated on-device — if a direct Files → Photos import doesn't merge them, try AirDropping the pair from a Mac instead.";
     } else {
       formatNote.hidden = true;
     }
@@ -812,24 +812,23 @@
     return bytes;
   }
 
-  function buildExifApp1(makerNoteBytes){
+  // IFD0/ExifSubIFD tag set below was reverse-engineered from two real Live Photo
+  // stills exported by the ToLive app (both AirDropped and confirmed working on
+  // iOS) — not guessed. Both samples were byte-identical apart from the UUID, and
+  // notably carry no Make/Model/Software at all.
+  function buildExifApp1(makerNoteBytes, width, height){
     var TIFF_HEADER_LEN = 8;
-    // IFD0 carries Make/Model/Software (real iPhone photos always have these
-    // alongside the Maker Note) plus the pointer to the Exif SubIFD.
-    var makeStr = new TextEncoder().encode("Apple\0");
-    var modelStr = new TextEncoder().encode("iPhone\0");
-    var softwareStr = new TextEncoder().encode("17.0\0");
-    var IFD0_ENTRY_COUNT = 4;
+    var IFD0_ENTRY_COUNT = 5;   // Orientation, XResolution, YResolution, ResolutionUnit, ExifIFDPointer
+    var EXIFSUB_ENTRY_COUNT = 4; // ExifVersion, MakerNote, PixelXDimension, PixelYDimension
     var IFD0_LEN = 2 + IFD0_ENTRY_COUNT*12 + 4;
-    var EXIFSUB_LEN = 18;
+    var EXIFSUB_LEN = 2 + EXIFSUB_ENTRY_COUNT*12 + 4;
 
     var exifIfdOffset = TIFF_HEADER_LEN;
     var exifSubIfdOffset = TIFF_HEADER_LEN + IFD0_LEN;
-    var stringAreaOffset = exifSubIfdOffset + EXIFSUB_LEN;
-    var makeOffset = stringAreaOffset;
-    var modelOffset = makeOffset + makeStr.length;
-    var softwareOffset = modelOffset + modelStr.length;
-    var makerNoteOffset = softwareOffset + softwareStr.length;
+    var dataAreaOffset = exifSubIfdOffset + EXIFSUB_LEN;
+    var xResOffset = dataAreaOffset;
+    var yResOffset = xResOffset + 8;
+    var makerNoteOffset = yResOffset + 8;
 
     var tiff = new Uint8Array(makerNoteOffset + makerNoteBytes.length);
     var view = new DataView(tiff.buffer);
@@ -840,35 +839,50 @@
 
     // IFD0
     view.setUint16(p, IFD0_ENTRY_COUNT, false); p += 2;
-    view.setUint16(p, 0x010F, false); p += 2;   // Make
-    view.setUint16(p, 2, false); p += 2;        // ASCII
-    view.setUint32(p, makeStr.length, false); p += 4;
-    view.setUint32(p, makeOffset, false); p += 4;
-    view.setUint16(p, 0x0110, false); p += 2;   // Model
-    view.setUint16(p, 2, false); p += 2;
-    view.setUint32(p, modelStr.length, false); p += 4;
-    view.setUint32(p, modelOffset, false); p += 4;
-    view.setUint16(p, 0x0131, false); p += 2;   // Software
-    view.setUint16(p, 2, false); p += 2;
-    view.setUint32(p, softwareStr.length, false); p += 4;
-    view.setUint32(p, softwareOffset, false); p += 4;
+    view.setUint16(p, 0x0112, false); p += 2;   // Orientation
+    view.setUint16(p, 3, false); p += 2;        // SHORT
+    view.setUint32(p, 1, false); p += 4;
+    view.setUint16(p, 1, false); p += 2; p += 2; // value=1, padded to 4 bytes
+    view.setUint16(p, 0x011A, false); p += 2;   // XResolution
+    view.setUint16(p, 5, false); p += 2;        // RATIONAL
+    view.setUint32(p, 1, false); p += 4;
+    view.setUint32(p, xResOffset, false); p += 4;
+    view.setUint16(p, 0x011B, false); p += 2;   // YResolution
+    view.setUint16(p, 5, false); p += 2;
+    view.setUint32(p, 1, false); p += 4;
+    view.setUint32(p, yResOffset, false); p += 4;
+    view.setUint16(p, 0x0128, false); p += 2;   // ResolutionUnit
+    view.setUint16(p, 3, false); p += 2;
+    view.setUint32(p, 1, false); p += 4;
+    view.setUint16(p, 2, false); p += 2; p += 2; // value=2 (inches), padded
     view.setUint16(p, 0x8769, false); p += 2;   // ExifIFDPointer
     view.setUint16(p, 4, false); p += 2;        // LONG
     view.setUint32(p, 1, false); p += 4;
     view.setUint32(p, exifSubIfdOffset, false); p += 4;
     view.setUint32(p, 0, false); p += 4;        // next IFD
 
-    // Exif SubIFD: one entry pointing to the MakerNote
-    view.setUint16(p, 1, false); p += 2;
+    // Exif SubIFD
+    view.setUint16(p, EXIFSUB_ENTRY_COUNT, false); p += 2;
+    view.setUint16(p, 0x9000, false); p += 2;   // ExifVersion
+    view.setUint16(p, 7, false); p += 2;        // UNDEFINED
+    view.setUint32(p, 4, false); p += 4;
+    tiff[p++]=0x30; tiff[p++]=0x32; tiff[p++]=0x32; tiff[p++]=0x31; // "0221", inline (4 bytes)
     view.setUint16(p, 0x927C, false); p += 2;   // MakerNote
     view.setUint16(p, 7, false); p += 2;        // UNDEFINED
     view.setUint32(p, makerNoteBytes.length, false); p += 4;
     view.setUint32(p, makerNoteOffset, false); p += 4;
+    view.setUint16(p, 0xA002, false); p += 2;   // PixelXDimension
+    view.setUint16(p, 4, false); p += 2;        // LONG
+    view.setUint32(p, 1, false); p += 4;
+    view.setUint32(p, width, false); p += 4;
+    view.setUint16(p, 0xA003, false); p += 2;   // PixelYDimension
+    view.setUint16(p, 4, false); p += 2;
+    view.setUint32(p, 1, false); p += 4;
+    view.setUint32(p, height, false); p += 4;
     view.setUint32(p, 0, false); p += 4;        // next IFD
 
-    tiff.set(makeStr, makeOffset);
-    tiff.set(modelStr, modelOffset);
-    tiff.set(softwareStr, softwareOffset);
+    view.setUint32(xResOffset, 72, false); view.setUint32(xResOffset+4, 1, false);
+    view.setUint32(yResOffset, 72, false); view.setUint32(yResOffset+4, 1, false);
     tiff.set(makerNoteBytes, makerNoteOffset);
 
     var exifHeader = new Uint8Array([0x45,0x78,0x69,0x66,0x00,0x00]); // "Exif\0\0"
@@ -881,8 +895,8 @@
     return app1;
   }
 
-  function injectContentIdentifierIntoJpeg(jpegBytes, uuid){
-    var app1 = buildExifApp1(buildAppleMakerNote(uuid));
+  function injectContentIdentifierIntoJpeg(jpegBytes, uuid, width, height){
+    var app1 = buildExifApp1(buildAppleMakerNote(uuid), width, height);
     var out = new Uint8Array(jpegBytes.length + app1.length);
     out[0] = 0xFF; out[1] = 0xD8;                 // SOI
     out.set(app1, 2);
@@ -932,11 +946,14 @@
     return out;
   }
 
+  // Byte layouts below were reverse-engineered directly from two real, working
+  // Live Photo MOV files (AirDropped, confirmed working on iOS), not guessed.
   function makeHdlrBox(){
-    var payload = new Uint8Array(25); // version/flags(4)+predefined(4)+handlerType(4)+reserved(12)+name(1)
+    var payload = new Uint8Array(26); // version/flags(4)+predefined(4)+handlerType(4)+reserved(12)+name(2)
     payload[8]=0x6d; payload[9]=0x64; payload[10]=0x74; payload[11]=0x61; // "mdta"
     return makeBox("hdlr", payload);
   }
+  // Movie-level meta/keys entries: size(4) + namespace(4)="mdta" + name — no wrapper.
   function makeKeysBox(keyNames){
     var entries = keyNames.map(function(name){
       var nameBytes = new TextEncoder().encode(name);
@@ -944,6 +961,24 @@
       new DataView(e.buffer).setUint32(0, e.length, false);
       e[4]=0x6d; e[5]=0x64; e[6]=0x74; e[7]=0x61; // "mdta" namespace
       e.set(nameBytes, 8);
+      return e;
+    });
+    var header = new Uint8Array(8);
+    new DataView(header.buffer).setUint32(4, keyNames.length, false);
+    return makeBox("keys", concatBytes([header].concat(entries)));
+  }
+  // Track-local (stsd/mebx) keys entries are wrapped differently: each entry is
+  // itself typed as "keyd", THEN carries namespace(4)="mdta" + name — confirmed
+  // by direct byte comparison against a real sample; the movie-level box above
+  // does not use this wrapper.
+  function makeTrackKeysBox(keyNames){
+    var entries = keyNames.map(function(name){
+      var nameBytes = new TextEncoder().encode(name);
+      var e = new Uint8Array(12 + nameBytes.length);
+      new DataView(e.buffer).setUint32(0, e.length, false);
+      e[4]=0x6b; e[5]=0x65; e[6]=0x79; e[7]=0x64;   // "keyd"
+      e[8]=0x6d; e[9]=0x64; e[10]=0x74; e[11]=0x61; // "mdta" namespace
+      e.set(nameBytes, 12);
       return e;
     });
     var header = new Uint8Array(8);
@@ -963,13 +998,14 @@
     });
     return makeBox("ilst", concatBytes(items));
   }
-  function buildContentIdentifierUdta(uuid){
+  // The real sample places `meta` as a DIRECT child of moov — no udta wrapper.
+  function buildContentIdentifierMeta(uuid){
     var metaPayload = concatBytes([
       makeHdlrBox(),
       makeKeysBox(["com.apple.quicktime.content.identifier"]),
       makeIlstBox([uuid])
     ]);
-    return makeBox("udta", makeBox("meta", metaPayload));
+    return makeBox("meta", metaPayload);
   }
 
   function patchChunkOffsets(bytes, moovBox, delta){
@@ -1001,16 +1037,16 @@
     var mdatBox = topBoxes.filter(function(b){ return b.type === "mdat"; })[0];
     if(!moovBox) throw new Error("No moov box found in generated video");
 
-    var newUdta = buildContentIdentifierUdta(uuid);
+    var newMeta = buildContentIdentifierMeta(uuid);
 
     // Inserting bytes into moov shifts everything after it in the file. Sample
     // offset tables (stco/co64) store absolute file positions into mdat, so if
     // mdat comes after moov, those tables need to shift by the same amount.
     if(mdatBox && moovBox.start < mdatBox.start){
-      patchChunkOffsets(bytes, moovBox, newUdta.length);
+      patchChunkOffsets(bytes, moovBox, newMeta.length);
     }
 
-    var newMoovPayload = concatBytes([bytes.slice(moovBox.dataStart, moovBox.end), newUdta]);
+    var newMoovPayload = concatBytes([bytes.slice(moovBox.dataStart, moovBox.end), newMeta]);
     var newMoovBox = makeBox("moov", newMoovPayload);
 
     return concatBytes(topBoxes.map(function(b){
@@ -1018,8 +1054,7 @@
     }));
   }
 
-  // ----- MOV/MP4: still-image-time timed metadata track (best-effort, less rigorously
-  // verified than the content-identifier piece — see the format note in the UI) -----
+  // ----- MOV/MP4: still-image-time timed metadata track -----
   function readU32(bytes, off){ return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(off, false); }
 
   function findMvhdTimescale(bytes, moovBox){
@@ -1071,10 +1106,10 @@
     return makeBox("dinf", makeBox("dref", drefPayload));
   }
   function makeStillImageTimeTrak(opts){
-    // opts: {trackId, videoTrackId, movieTimescale, mediaTimescale, sampleDuration}
+    // opts: {trackId, movieTimescale, mediaTimescale, sampleDuration}
     // returns {trak, stcoValueOffset} — stcoValueOffset is the byte offset, relative to
     // the start of `trak`, of the one chunk_offset value the caller must patch in later.
-    var keys = makeKeysBox(["com.apple.quicktime.still-image-time"]);
+    var keys = makeTrackKeysBox(["com.apple.quicktime.still-image-time"]);
     var mebxPayload = new Uint8Array(8); // reserved(6) + data_reference_index(2)
     mebxPayload[7] = 1;
     var mebxEntry = makeBox("mebx", concatBytes([mebxPayload, keys]));
@@ -1116,26 +1151,27 @@
 
     var boxesBeforeStco = [stsd, stts, stsc, stsz];
     var stbl = makeBox("stbl", concatBytes(boxesBeforeStco.concat([stco])));
-    var nmhd = makeBox("nmhd", new Uint8Array(4));
+    // real samples use gmhd+gmin (generic media header) for meta tracks, not nmhd;
+    // gmin's payload is a fixed boilerplate template copied verbatim from a real file
+    var gmin = makeBox("gmin", new Uint8Array([0,0,0,0, 0x00,0x40, 0x80,0x00, 0x80,0x00, 0x80,0x00, 0,0, 0,0]));
+    var gmhd = makeBox("gmhd", gmin);
     var dinf = makeDinf();
-    var minf = makeBox("minf", concatBytes([nmhd, dinf, stbl]));
+    var minf = makeBox("minf", concatBytes([gmhd, dinf, stbl]));
     var mdhd = makeMdhd(opts.mediaTimescale, opts.sampleDuration);
     var hdlr = makeMdiaHdlr("meta");
     var mdia = makeBox("mdia", concatBytes([mdhd, hdlr, minf]));
-    var cdscPayload = new Uint8Array(4);
-    new DataView(cdscPayload.buffer).setUint32(0, opts.videoTrackId, false);
-    var tref = makeBox("tref", makeBox("cdsc", cdscPayload));
+    // no tref/cdsc — real samples don't link the meta track to the video track this way
     var movieDuration = Math.round(opts.movieTimescale * (opts.sampleDuration / opts.mediaTimescale));
     var tkhd = makeTkhd(opts.trackId, movieDuration);
-    var trak = makeBox("trak", concatBytes([tkhd, tref, mdia]));
+    var trak = makeBox("trak", concatBytes([tkhd, mdia]));
 
     // stco's chunk_offset sits 8 bytes into stco's payload, i.e. 16 bytes into the
     // stco box (8-byte box header + 8-byte payload prefix). Locate stco's start by
     // summing everything before it, all the way up through trak's own header.
     var stblChildrenBeforeStco = boxesBeforeStco.reduce(function(s,b){ return s+b.length; }, 0);
-    var stcoStartInTrak = 8 /*trak header*/ + tkhd.length + tref.length +
+    var stcoStartInTrak = 8 /*trak header*/ + tkhd.length +
       8 /*mdia header*/ + mdhd.length + hdlr.length +
-      8 /*minf header*/ + nmhd.length + dinf.length +
+      8 /*minf header*/ + gmhd.length + dinf.length +
       8 /*stbl header*/ + stblChildrenBeforeStco;
 
     return { trak: trak, stcoValueOffset: stcoStartInTrak + 16 };
@@ -1150,12 +1186,10 @@
     var movieTimescale = findMvhdTimescale(bytes, moovBox);
     var trackIds = findTrackIds(bytes, moovBox);
     var newTrackId = Math.max.apply(null, trackIds.concat([0])) + 1;
-    var videoTrackId = trackIds[0];
     var MEDIA_TIMESCALE = 600, SAMPLE_DURATION = 1; // ~1.7ms marker sample
 
     var built = makeStillImageTimeTrak({
       trackId: newTrackId,
-      videoTrackId: videoTrackId,
       movieTimescale: movieTimescale,
       mediaTimescale: MEDIA_TIMESCALE,
       sampleDuration: SAMPLE_DURATION
@@ -1224,7 +1258,7 @@
         return;
       }
       stillBlob.arrayBuffer().then(function(stillBuf){
-        var taggedJpegBytes = injectContentIdentifierIntoJpeg(new Uint8Array(stillBuf), uuid);
+        var taggedJpegBytes = injectContentIdentifierIntoJpeg(new Uint8Array(stillBuf), uuid, size.w, size.h);
 
         var stream = exportCanvas.captureStream(0);
         var track = stream.getVideoTracks()[0];
