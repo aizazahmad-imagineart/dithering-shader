@@ -121,6 +121,11 @@
   }
   .dock-select option{ background:#14161b; color:var(--text); }
 
+  .formatNote{
+    font-size:9.5px; line-height:1.4; color:var(--text-dim);
+    max-width:220px; margin-top:2px;
+  }
+
   .divider{ width:1px; align-self:stretch; background:var(--hairline); }
 
   .dlbtn{
@@ -239,6 +244,7 @@
     <div class="select-wrap">
       <select id="format" class="dock-select"></select>
     </div>
+    <div class="formatNote" id="formatNote" hidden></div>
   </div>
 
   <div class="divider"></div>
@@ -338,7 +344,8 @@
   var FORMATS = [
     { key: "webm", name: "WebM (recommended)", kind: "video" },
     { key: "mp4",  name: "MP4 (phone lock screens)", kind: "video" },
-    { key: "jpeg", name: "JPEG (still image)", kind: "image" }
+    { key: "jpeg", name: "JPEG (still image)", kind: "image" },
+    { key: "livephoto", name: "Live Photo (iOS, experimental)", kind: "livephoto" }
   ];
 
   // ---------- state ----------
@@ -639,9 +646,19 @@
     formatSelect.appendChild(opt);
   });
   var downloadLabel = document.getElementById("downloadLabel");
+  var formatNote = document.getElementById("formatNote");
   function updateDownloadLabel(){
     var f = FORMATS.filter(function(x){ return x.key === state.exportFormat; })[0] || FORMATS[0];
-    downloadLabel.textContent = f.kind === "image" ? "Download image" : "Download loop";
+    if(f.kind === "image") downloadLabel.textContent = "Download image";
+    else if(f.kind === "livephoto") downloadLabel.textContent = "Download Live Photo";
+    else downloadLabel.textContent = "Download loop";
+
+    if(f.kind === "livephoto"){
+      formatNote.hidden = false;
+      formatNote.textContent = "Experimental: saves a JPEG+MOV pair tagged to pair as a Live Photo. Works best AirDropped together from a Mac — a direct Files → Photos import may not merge them on every iOS version.";
+    } else {
+      formatNote.hidden = true;
+    }
   }
   formatSelect.addEventListener("change", function(){
     state.exportFormat = formatSelect.value;
@@ -749,8 +766,345 @@
     }, "image/jpeg", 0.92);
   }
 
+  // ---------- Live Photo (iOS) export: experimental ----------
+  // Builds a JPEG + MOV pair sharing an Apple "Content Identifier" so iOS Photos
+  // can offer to treat them as a single Live Photo. Byte layout for the JPEG's
+  // Apple Maker Note was verified against a real iPhone sample (ExifTool's own
+  // test image), not guessed from memory. The MOV side embeds the matching
+  // identifier as standard QuickTime keyed metadata (moov/udta/meta/keys+ilst).
+  // Known limitation: we do not embed the "still image time" timed-metadata
+  // track real Apple Live Photos include — many third-party generators skip
+  // this too and still get recognized, but full fidelity would add it later.
+
+  function uuidForLivePhoto(){
+    if(crypto.randomUUID) return crypto.randomUUID().toUpperCase();
+    var bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    var hex = Array.prototype.map.call(bytes, function(b){ return b.toString(16).padStart(2,"0"); }).join("");
+    return (hex.slice(0,8)+"-"+hex.slice(8,12)+"-"+hex.slice(12,16)+"-"+hex.slice(16,20)+"-"+hex.slice(20)).toUpperCase();
+  }
+
+  // ----- JPEG: inject Apple Maker Note ContentIdentifier via a standard EXIF APP1 segment -----
+  function buildAppleMakerNote(uuid){
+    var strBytes = new TextEncoder().encode(uuid + "\0"); // ASCII EXIF strings are null-terminated
+    var HEADER_LEN = 16; // "Apple iOS\0"(10) + version(2) + "MM"(2) + entryCount(2)
+    var ENTRY_LEN = 12;
+    var NEXT_IFD_LEN = 4;
+    var stringOffset = HEADER_LEN + ENTRY_LEN + NEXT_IFD_LEN;
+    var buf = new ArrayBuffer(stringOffset + strBytes.length);
+    var view = new DataView(buf);
+    var bytes = new Uint8Array(buf);
+    var p = 0;
+    var sig = "Apple iOS";
+    for(var i=0;i<sig.length;i++) bytes[p++] = sig.charCodeAt(i);
+    bytes[p++] = 0;
+    view.setUint16(p, 1, false); p += 2;        // version
+    bytes[p++] = 0x4D; bytes[p++] = 0x4D;       // "MM" byte order
+    view.setUint16(p, 1, false); p += 2;        // IFD entry count = 1
+    view.setUint16(p, 0x0011, false); p += 2;   // tag: ContentIdentifier
+    view.setUint16(p, 2, false); p += 2;        // type: ASCII
+    view.setUint32(p, strBytes.length, false); p += 4;
+    view.setUint32(p, stringOffset, false); p += 4; // offset, relative to byte 0 of this blob
+    view.setUint32(p, 0, false); p += 4;        // next IFD = none
+    bytes.set(strBytes, p);
+    return bytes;
+  }
+
+  function buildExifApp1(makerNoteBytes){
+    var TIFF_HEADER_LEN = 8, IFD0_LEN = 18, EXIFSUB_LEN = 18;
+    var exifIfdOffset = TIFF_HEADER_LEN;
+    var makerNoteOffset = TIFF_HEADER_LEN + IFD0_LEN + EXIFSUB_LEN;
+    var tiff = new Uint8Array(makerNoteOffset + makerNoteBytes.length);
+    var view = new DataView(tiff.buffer);
+    var p = 0;
+    tiff[p++] = 0x4D; tiff[p++] = 0x4D;         // "MM"
+    view.setUint16(p, 0x002A, false); p += 2;   // TIFF magic
+    view.setUint32(p, exifIfdOffset, false); p += 4;
+    // IFD0: one entry pointing to the Exif SubIFD
+    view.setUint16(p, 1, false); p += 2;
+    view.setUint16(p, 0x8769, false); p += 2;   // ExifIFDPointer
+    view.setUint16(p, 4, false); p += 2;        // LONG
+    view.setUint32(p, 1, false); p += 4;
+    view.setUint32(p, TIFF_HEADER_LEN + IFD0_LEN, false); p += 4;
+    view.setUint32(p, 0, false); p += 4;        // next IFD
+    // Exif SubIFD: one entry pointing to the MakerNote
+    view.setUint16(p, 1, false); p += 2;
+    view.setUint16(p, 0x927C, false); p += 2;   // MakerNote
+    view.setUint16(p, 7, false); p += 2;        // UNDEFINED
+    view.setUint32(p, makerNoteBytes.length, false); p += 4;
+    view.setUint32(p, makerNoteOffset, false); p += 4;
+    view.setUint32(p, 0, false); p += 4;        // next IFD
+    tiff.set(makerNoteBytes, p);
+
+    var exifHeader = new Uint8Array([0x45,0x78,0x69,0x66,0x00,0x00]); // "Exif\0\0"
+    var payloadLen = 2 + exifHeader.length + tiff.length;
+    var app1 = new Uint8Array(2 + payloadLen);
+    app1[0] = 0xFF; app1[1] = 0xE1;
+    new DataView(app1.buffer).setUint16(2, payloadLen, false);
+    app1.set(exifHeader, 4);
+    app1.set(tiff, 4 + exifHeader.length);
+    return app1;
+  }
+
+  function injectContentIdentifierIntoJpeg(jpegBytes, uuid){
+    var app1 = buildExifApp1(buildAppleMakerNote(uuid));
+    var out = new Uint8Array(jpegBytes.length + app1.length);
+    out[0] = 0xFF; out[1] = 0xD8;                 // SOI
+    out.set(app1, 2);
+    out.set(jpegBytes.subarray(2), 2 + app1.length);
+    return out;
+  }
+
+  // ----- MOV/MP4: generic ISO-BMFF box parsing + QuickTime metadata injection -----
+  function parseBoxes(bytes, start, end){
+    var view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    var boxes = [];
+    var pos = start;
+    while(pos + 8 <= end){
+      var size32 = view.getUint32(pos, false);
+      var type = String.fromCharCode(bytes[pos+4], bytes[pos+5], bytes[pos+6], bytes[pos+7]);
+      var headerLen = 8, size = size32;
+      if(size32 === 1){ size = Number(view.getBigUint64(pos+8, false)); headerLen = 16; }
+      else if(size32 === 0){ size = end - pos; }
+      if(size <= 0) break;
+      boxes.push({ type: type, start: pos, dataStart: pos + headerLen, end: pos + size });
+      pos += size;
+    }
+    return boxes;
+  }
+
+  var MP4_CONTAINER_TYPES = ["moov","trak","mdia","minf","stbl","udta","edts"];
+  function findBoxesRecursive(bytes, start, end, targetTypes, results){
+    parseBoxes(bytes, start, end).forEach(function(b){
+      if(targetTypes.indexOf(b.type) !== -1) results.push(b);
+      if(MP4_CONTAINER_TYPES.indexOf(b.type) !== -1){
+        findBoxesRecursive(bytes, b.dataStart, b.end, targetTypes, results);
+      }
+    });
+  }
+
+  function makeBox(type, payload){
+    var out = new Uint8Array(8 + payload.length);
+    new DataView(out.buffer).setUint32(0, out.length, false);
+    for(var i=0;i<4;i++) out[4+i] = type.charCodeAt(i);
+    out.set(payload, 8);
+    return out;
+  }
+  function concatBytes(arrays){
+    var total = arrays.reduce(function(s,a){ return s + a.length; }, 0);
+    var out = new Uint8Array(total), off = 0;
+    arrays.forEach(function(a){ out.set(a, off); off += a.length; });
+    return out;
+  }
+
+  function makeHdlrBox(){
+    var payload = new Uint8Array(25); // version/flags(4)+predefined(4)+handlerType(4)+reserved(12)+name(1)
+    payload[8]=0x6d; payload[9]=0x64; payload[10]=0x74; payload[11]=0x61; // "mdta"
+    return makeBox("hdlr", payload);
+  }
+  function makeKeysBox(keyNames){
+    var entries = keyNames.map(function(name){
+      var nameBytes = new TextEncoder().encode(name);
+      var e = new Uint8Array(8 + nameBytes.length);
+      new DataView(e.buffer).setUint32(0, e.length, false);
+      e[4]=0x6d; e[5]=0x64; e[6]=0x74; e[7]=0x61; // "mdta" namespace
+      e.set(nameBytes, 8);
+      return e;
+    });
+    var header = new Uint8Array(8);
+    new DataView(header.buffer).setUint32(4, keyNames.length, false);
+    return makeBox("keys", concatBytes([header].concat(entries)));
+  }
+  function makeIlstBox(values){
+    var items = values.map(function(val, idx){
+      var valBytes = new TextEncoder().encode(val);
+      var dataPayload = new Uint8Array(8 + valBytes.length);
+      new DataView(dataPayload.buffer).setUint32(0, 1, false); // well-known type: UTF-8 string
+      dataPayload.set(valBytes, 8);
+      var dataBox = makeBox("data", dataPayload);
+      var n = idx + 1; // 1-based index into the keys table, used as the raw 4-byte "type"
+      var itemType = String.fromCharCode((n>>>24)&0xFF, (n>>>16)&0xFF, (n>>>8)&0xFF, n&0xFF);
+      return makeBox(itemType, dataBox);
+    });
+    return makeBox("ilst", concatBytes(items));
+  }
+  function buildContentIdentifierUdta(uuid){
+    var metaPayload = concatBytes([
+      makeHdlrBox(),
+      makeKeysBox(["com.apple.quicktime.content.identifier"]),
+      makeIlstBox([uuid])
+    ]);
+    return makeBox("udta", makeBox("meta", metaPayload));
+  }
+
+  function patchChunkOffsets(bytes, moovBox, delta){
+    if(delta === 0) return;
+    var targets = [];
+    findBoxesRecursive(bytes, moovBox.dataStart, moovBox.end, ["stco","co64"], targets);
+    var view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    targets.forEach(function(b){
+      var entryCount = view.getUint32(b.dataStart + 4, false);
+      var entryStart = b.dataStart + 8;
+      if(b.type === "stco"){
+        for(var i=0;i<entryCount;i++){
+          var off = entryStart + i*4;
+          view.setUint32(off, view.getUint32(off, false) + delta, false);
+        }
+      } else {
+        for(var j=0;j<entryCount;j++){
+          var off8 = entryStart + j*8;
+          view.setBigUint64(off8, view.getBigUint64(off8, false) + BigInt(delta), false);
+        }
+      }
+    });
+  }
+
+  function injectContentIdentifierIntoMp4(mp4Bytes, uuid){
+    var bytes = new Uint8Array(mp4Bytes); // mutable copy
+    var topBoxes = parseBoxes(bytes, 0, bytes.length);
+    var moovBox = topBoxes.filter(function(b){ return b.type === "moov"; })[0];
+    var mdatBox = topBoxes.filter(function(b){ return b.type === "mdat"; })[0];
+    if(!moovBox) throw new Error("No moov box found in generated video");
+
+    var newUdta = buildContentIdentifierUdta(uuid);
+
+    // Inserting bytes into moov shifts everything after it in the file. Sample
+    // offset tables (stco/co64) store absolute file positions into mdat, so if
+    // mdat comes after moov, those tables need to shift by the same amount.
+    if(mdatBox && moovBox.start < mdatBox.start){
+      patchChunkOffsets(bytes, moovBox, newUdta.length);
+    }
+
+    var newMoovPayload = concatBytes([bytes.slice(moovBox.dataStart, moovBox.end), newUdta]);
+    var newMoovBox = makeBox("moov", newMoovPayload);
+
+    return concatBytes(topBoxes.map(function(b){
+      return b === moovBox ? newMoovBox : bytes.slice(b.start, b.end);
+    }));
+  }
+
+  function downloadLivePhoto(){
+    if(!window.MediaRecorder){
+      toast("MediaRecorder is not supported in this browser.");
+      return;
+    }
+    var picked = pickMimeType("mp4");
+    if(!picked || !picked.matchedPreference){
+      toast("This browser can't record MP4, which Live Photo needs. Try Chrome or Safari.");
+      return;
+    }
+
+    downloadBtn.classList.add("busy");
+    downloadBtn.disabled = true;
+
+    cancelAnimationFrame(rafId);
+
+    var size = resolveExportSize();
+    var xr = getExportRenderer();
+    exportCanvas.width = size.w;
+    exportCanvas.height = size.h;
+
+    var uuid = uuidForLivePhoto();
+    var FPS = 30, CLIP_DURATION = 2.7;
+    var totalFrames = Math.round(FPS * CLIP_DURATION);
+    // lastLiveT is already speed-scaled shader time (radians), not seconds — the
+    // still moment sits at the clip's midpoint, like a real Live Photo's key frame
+    var clipStartT = lastLiveT - (CLIP_DURATION/2) * state.speed;
+
+    function finish(){
+      downloadBtn.classList.remove("busy");
+      downloadBtn.disabled = false;
+      rafId = requestAnimationFrame(liveLoop);
+    }
+
+    // capture the still frame first, at the exact midpoint moment ("now")
+    xr.draw(lastLiveT, size.w, size.h, size.px);
+    exportCanvas.toBlob(function(stillBlob){
+      if(!stillBlob){
+        toast("Couldn't capture the still frame in this browser.");
+        finish();
+        return;
+      }
+      stillBlob.arrayBuffer().then(function(stillBuf){
+        var taggedJpegBytes = injectContentIdentifierIntoJpeg(new Uint8Array(stillBuf), uuid);
+
+        var stream = exportCanvas.captureStream(0);
+        var track = stream.getVideoTracks()[0];
+        var canRequestFrame = typeof track.requestFrame === "function";
+        if(!canRequestFrame) stream = exportCanvas.captureStream(FPS);
+
+        var chunks = [];
+        var recorder = new MediaRecorder(stream, { mimeType: picked.mimeType, videoBitsPerSecond: 8000000 });
+        recorder.ondataavailable = function(e){ if(e.data && e.data.size > 0) chunks.push(e.data); };
+        recorder.onstop = function(){
+          var videoBlob = new Blob(chunks, { type: picked.mimeType.split(";")[0] });
+          videoBlob.arrayBuffer().then(function(videoBuf){
+            var taggedMovBytes;
+            try{
+              taggedMovBytes = injectContentIdentifierIntoMp4(new Uint8Array(videoBuf), uuid);
+            } catch(err){
+              toast("Couldn't tag the video: " + err.message);
+              finish();
+              return;
+            }
+
+            var base = "dithering-live-" + uuid.slice(0,8).toLowerCase();
+            var jpegFile = new File([taggedJpegBytes], base + ".jpg", { type: "image/jpeg" });
+            var movFile = new File([taggedMovBytes], base + ".mov", { type: "video/quicktime" });
+
+            function fallbackDownload(){
+              [jpegFile, movFile].forEach(function(file, i){
+                setTimeout(function(){
+                  var url = URL.createObjectURL(file);
+                  var a = document.createElement("a");
+                  a.href = url; a.download = file.name;
+                  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+                  setTimeout(function(){ URL.revokeObjectURL(url); }, 4000);
+                }, i * 250);
+              });
+              toast("Saved photo + video pair — see the note on importing as a Live Photo.");
+              finish();
+            }
+
+            if(navigator.canShare && navigator.canShare({ files: [jpegFile, movFile] })){
+              navigator.share({ files: [jpegFile, movFile] }).then(finish).catch(function(err){
+                if(err && err.name === "AbortError"){ finish(); return; }
+                fallbackDownload();
+              });
+            } else {
+              fallbackDownload();
+            }
+          });
+        };
+
+        recorder.start();
+        var frame = 0;
+        function renderFrame(){
+          if(frame >= totalFrames){ recorder.stop(); return; }
+          xr.draw(clipStartT + (frame/FPS) * state.speed, size.w, size.h, size.px);
+          if(canRequestFrame){
+            track.requestFrame();
+            frame++;
+            setTimeout(renderFrame, 1000/FPS);
+          } else {
+            frame++;
+            requestAnimationFrame(renderFrame);
+          }
+        }
+        renderFrame();
+      });
+    }, "image/jpeg", 0.92);
+  }
+
   downloadBtn.addEventListener("click", function(){
     if(downloadBtn.classList.contains("busy")) return;
+
+    if(state.exportFormat === "livephoto"){
+      downloadLivePhoto();
+      return;
+    }
 
     if(state.exportFormat === "jpeg"){
       downloadImageSnapshot();
