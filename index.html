@@ -1203,7 +1203,7 @@
     exportCanvas.height = size.h;
 
     var uuid = uuidForLivePhoto();
-    var FPS = 30, CLIP_DURATION = 2.7;
+    var FPS = 30, CLIP_DURATION = 1.8; // real Live Photos run short; keep comfortably under ~2s
     var totalFrames = Math.round(FPS * CLIP_DURATION);
     // lastLiveT is already speed-scaled shader time (radians), not seconds — the
     // still moment sits at the clip's midpoint, like a real Live Photo's key frame
