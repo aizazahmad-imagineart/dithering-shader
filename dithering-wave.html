@@ -26,6 +26,18 @@
   }
   .title b{ color:var(--text); font-weight:600; }
 
+  .credit{
+    position:fixed; top:28px; right:32px; z-index:6;
+    font-size:11px; letter-spacing:0.1em; color:var(--text-dim);
+    text-decoration:none; opacity:0.5;
+    padding:4px 8px; margin:-4px -8px;
+    border-radius:4px;
+    transition: color 0.15s ease, opacity 0.15s ease, background-color 0.15s ease;
+  }
+  .credit:hover{ color:var(--text); opacity:0.9; background:rgba(255,255,255,0.05); }
+  .credit:active{ opacity:0.6; transform: translateY(1px); }
+  .credit:focus-visible{ outline:1px solid var(--hairline); outline-offset:2px; }
+
   .dock{
     position:fixed; left:50%; bottom:24px; transform:translateX(-50%);
     z-index:10;
@@ -134,6 +146,7 @@
 
 <canvas id="gl"></canvas>
 <div class="title"><b>Dithering</b> / <span id="titleProfile">wave</span> / 8×8</div>
+<a class="credit" href="https://aizaz.framer.website/" target="_blank" rel="noopener noreferrer">Aizaz Ahmad</a>
 <div class="toast" id="toast"></div>
 
 <div class="dock">
