@@ -637,10 +637,20 @@
     xcanvas.height = exportH;
 
     var FPS = 30;
-    var TARGET_DURATION = 3.5; // seconds, within the requested 3-4s window
-    // number of full sine cycles so the clip loops seamlessly regardless of speed
-    var cycles = Math.max(1, Math.round(state.speed * TARGET_DURATION / (2 * Math.PI)));
-    var angularSpeed = (cycles * 2 * Math.PI) / TARGET_DURATION;
+    var MIN_DURATION = 3, MAX_DURATION = 6.7; // small safety margin under the 7s ceiling for setTimeout drift
+    // one full cycle at the configured speed, seamlessly looped; slower speeds
+    // simply take longer (up to the cap) instead of being sped up to a fixed length
+    var naturalPeriod = (2 * Math.PI) / state.speed;
+    var cycles = Math.max(1, Math.ceil(MIN_DURATION / naturalPeriod));
+    var idealDuration = cycles * naturalPeriod;
+    var TARGET_DURATION, angularSpeed;
+    if(idealDuration <= MAX_DURATION){
+      TARGET_DURATION = idealDuration;
+      angularSpeed = state.speed; // exact configured speed, perfect loop
+    } else {
+      TARGET_DURATION = MAX_DURATION;
+      angularSpeed = (cycles * 2 * Math.PI) / TARGET_DURATION; // closest rate achievable within the cap
+    }
     var totalFrames = Math.round(FPS * TARGET_DURATION);
 
     var stream = xcanvas.captureStream(0); // manual frame control
@@ -677,7 +687,7 @@
 
     var frame = 0;
     function renderExportFrame(){
-      if(frame > totalFrames){
+      if(frame >= totalFrames){
         recorder.stop();
         return;
       }
